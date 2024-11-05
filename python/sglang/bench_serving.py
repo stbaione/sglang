@@ -301,6 +301,84 @@ async def async_request_sglang_generate(
     return output
 
 
+async def async_request_shortfin_generate(
+    request_func_input: RequestFuncInput,
+    pbar: Optional[tqdm] = None,
+) -> RequestFuncOutput:
+    api_url = request_func_input.api_url
+    prompt = request_func_input.prompt
+
+    async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
+        payload = {
+            "text": prompt,
+            "sampling_params": {
+                "temperature": 0.0,
+                "max_new_tokens": request_func_input.output_len,
+                "ignore_eos": not args.disable_ignore_eos,
+            },
+            "stream": not args.disable_stream,
+            **request_func_input.extra_request_body,
+        }
+        headers = {}
+
+        output = RequestFuncOutput()
+        output.prompt_len = request_func_input.prompt_len
+
+        generated_text = ""
+        ttft = 0.0
+        st = time.perf_counter()
+        most_recent_timestamp = st
+        try:
+            async with session.post(
+                url=api_url, json=payload, headers=headers
+            ) as response:
+                if response.status == 200:
+                    async for chunk_bytes in response.content:
+                        chunk_bytes = chunk_bytes.strip()
+                        if not chunk_bytes:
+                            continue
+                        # print(chunk_bytes)
+
+                        chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
+                        latency = time.perf_counter() - st
+                        if chunk == "[DONE]":
+                            pass
+                        else:
+                            data = chunk
+
+                            # NOTE: Some completion API might have a last
+                            # usage summary response without a token so we
+                            # want to check a token was generated
+                            timestamp = time.perf_counter()
+                            # First token
+                            if ttft == 0.0:
+                                ttft = time.perf_counter() - st
+                                output.ttft = ttft
+
+                            # Decoding phase
+                            else:
+                                output.itl.append(timestamp - most_recent_timestamp)
+
+                            most_recent_timestamp = timestamp
+                            generated_text = data
+
+                    output.generated_text = generated_text
+                    output.success = True
+                    output.latency = latency
+                    output.output_len = request_func_input.output_len
+                else:
+                    output.error = response.reason or ""
+                    output.success = False
+        except Exception:
+            output.success = False
+            exc_info = sys.exc_info()
+            output.error = "".join(traceback.format_exception(*exc_info))
+
+    if pbar:
+        pbar.update(1)
+    return output
+
+
 async def async_request_gserver(
     request_func_input: RequestFuncInput,
     pbar: Optional[tqdm] = None,
@@ -346,6 +424,7 @@ ASYNC_REQUEST_FUNCS = {
     "sglang": async_request_sglang_generate,
     "sglang-native": async_request_sglang_generate,
     "sglang-oai": async_request_openai_completions,
+    "shortfin": async_request_shortfin_generate,
     "vllm": async_request_openai_completions,
     "lmdeploy": async_request_openai_completions,
     "trt": async_request_trt_llm,
@@ -869,6 +948,7 @@ def run_benchmark(args_: argparse.Namespace):
             "sglang": 30000,
             "sglang-native": 30000,
             "sglang-oai": 30000,
+            "shortfin": 8000,
             "lmdeploy": 23333,
             "vllm": 8000,
             "trt": 8000,
@@ -881,7 +961,7 @@ def run_benchmark(args_: argparse.Namespace):
         else f"http://{args.host}:{args.port}/v1/models"
     )
 
-    if args.backend in ["sglang", "sglang-native"]:
+    if args.backend in ["sglang", "sglang-native", "shortfin"]:
         api_url = (
             f"{args.base_url}/generate"
             if args.base_url
@@ -907,7 +987,7 @@ def run_benchmark(args_: argparse.Namespace):
         args.model = args.model or "default"
 
     # Get model name
-    if args.model is None:
+    if args.model is None and args.backend != "shortfin":
         try:
             response = requests.get(model_url)
             model_list = response.json().get("data", [])
@@ -919,7 +999,7 @@ def run_benchmark(args_: argparse.Namespace):
             )
             sys.exit(1)
 
-    if args.model is None:
+    if args.model is None and args.backend != "shortfin":
         print("No model specified or found. Please provide a model using `--model`.")
         sys.exit(1)
 

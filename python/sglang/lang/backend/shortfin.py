@@ -1,4 +1,3 @@
-import json
 from typing import Optional
 
 from sglang.lang.backend.base_backend import BaseBackend
